@@ -1,0 +1,34 @@
+[package]
+name = "truehd-atmos-ffi"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "C-callable Dolby TrueHD / Atmos (object presentation) decoder for Apple platforms, built on the truehd crate"
+publish = false
+rust-version = "1.88"
+
+[lib]
+name = "truehd_atmos"
+# staticlib is what the xcframework ships; rlib lets the Rust tests and examples link it.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# truehdd workspace, library crate only. Pinned to an exact commit so a rebuild decodes
+# exactly what was verified; bump deliberately and re-run the harness.
+truehd = { git = "https://github.com/truehdd/truehdd", rev = "45eff984e3e5ab0cf36a47d12148b1628c38bda4", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+# Unwinding stays on: every exported function catches panics at the FFI boundary.
+panic = "unwind"
+incremental = false
+
+[profile.dev]
+# The decoder is too slow unoptimised to run the sample tests in reasonable time.
+opt-level = 2
+
+[dev-dependencies]
+anyhow = "1.0"

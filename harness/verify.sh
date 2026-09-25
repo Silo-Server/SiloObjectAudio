@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# verify.sh - verify SiloObjectAudio.xcframework against truehdd's own decoder.
+#
+# Usage: harness/verify.sh        (after ./build.sh)
+#
+# Working files (samples, the truehdd checkout, reference decodes) live in $TRUEHD_ATMOS_WORK,
+# default .work/ in this repository (gitignored).
+#
+# 1. Fetches the test samples into $TRUEHD_ATMOS_WORK/samples if missing (Dolby "Unfold" demo and the first
+#    120 s of Dolby's 7.1.4 Atmos test file, both from archive.org; FFmpeg's FATE atmos.thd).
+# 2. Clones truehdd at the commit Cargo.toml pins, builds its CLI and writes reference
+#    decodes into ../ref.
+# 3. Builds the C harness against the xcframework's macOS slice and runs it: bit-exact PCM,
+#    object metadata against truehdd's .atmos.metadata, reset/seek, arbitrary chunking.
+# 4. Links a small C program against every other slice, and compiles and runs a Swift program
+#    through the module map (`import SiloObjectAudio`).
+# Requires Homebrew ffmpeg (libavformat for demuxing, the ffmpeg CLI for sample extraction).
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CRATE="$(dirname "$HERE")"
+ROOT="${TRUEHD_ATMOS_WORK:-$CRATE/.work}"
+SAMPLES="$ROOT/samples"
+REF="$ROOT/ref"
+XCFW="$CRATE/SiloObjectAudio.xcframework"
+OUT="$CRATE/build/verify"
+ASSETS="$ROOT/truehdd/truehd/tests/assets"
+for dir in /opt/homebrew/opt/rustup/bin "$HOME/.cargo/bin"; do
+    [ -d "$dir" ] && PATH="$dir:$PATH"
+done
+export PATH
+
+[ -d "$XCFW" ] || { echo "ERROR: build the xcframework first (./build.sh)" >&2; exit 1; }
+mkdir -p "$SAMPLES" "$REF/fixtures" "$OUT"
+
+# ---- samples ----------------------------------------------------------------------------
+UNFOLD_URL='https://archive.org/download/dolby-unfold-lossless-7.1/Dolby%20Unfold%20%5BLossless%5D%20%5B7.1%5D.m2ts'
+DOLBY714_URL='https://archive.org/download/dolby-atmos-true-hd-e-ac-3-7.1.4-7.1.4-dolby-atmos/Dolby%20Atmos%20TrueHD%2C%20E-AC-3%207.1.4%5B7.1.4%20dolby%20atmos%5D.mkv'
+if [ ! -f "$SAMPLES/dolby-unfold-lossless.m2ts" ]; then
+    echo "==> Fetching Dolby Unfold demo (91 MB)"
+    curl -fsSL -o "$SAMPLES/dolby-unfold-lossless.m2ts" "$UNFOLD_URL"
+fi
+[ -f "$SAMPLES/dolby-unfold.thd" ] ||
+    ffmpeg -nostdin -loglevel error -i "$SAMPLES/dolby-unfold-lossless.m2ts" -map 0:a:0 -c copy -f truehd "$SAMPLES/dolby-unfold.thd"
+if [ ! -f "$SAMPLES/dolby-714-test-120s.mka" ]; then
+    echo "==> Fetching the first 120 s of Dolby's 7.1.4 Atmos test file (audio only)"
+    ffmpeg -nostdin -loglevel error -rw_timeout 60000000 -i "$DOLBY714_URL" -map 0:a:0 -c copy -t 120 "$SAMPLES/dolby-714-test-120s.mka"
+fi
+[ -f "$SAMPLES/dolby-714-test-120s.thd" ] ||
+    ffmpeg -nostdin -loglevel error -i "$SAMPLES/dolby-714-test-120s.mka" -map 0:a:0 -c copy -f truehd "$SAMPLES/dolby-714-test-120s.thd"
+[ -f "$SAMPLES/fate-atmos.thd" ] ||
+    curl -fsSL -o "$SAMPLES/fate-atmos.thd" https://fate-suite.ffmpeg.org/truehd/atmos.thd
+
+# ---- references from truehdd -------------------------------------------------------------
+TRUEHDD_REV="$(sed -nE 's/^truehd = .*rev = "([0-9a-f]+)".*/\1/p' "$CRATE/Cargo.toml")"
+if [ ! -d "$ROOT/truehdd/.git" ]; then
+    echo "==> Cloning truehdd at $TRUEHDD_REV"
+    git clone --quiet https://github.com/truehdd/truehdd "$ROOT/truehdd"
+fi
+git -C "$ROOT/truehdd" checkout --quiet "$TRUEHDD_REV"
+TRUEHDD="$ROOT/truehdd/target/release/truehdd"
+if [ ! -x "$TRUEHDD" ]; then
+    echo "==> Building the truehdd CLI"
+    (cd "$ROOT/truehdd" && cargo build --release --locked)
+fi
+reference() { # <output base> <truehdd decode args...>
+    local base="$1"
+    shift
+    [ -e "$base.atmos.audio" ] || [ -e "$base.caf" ] ||
+        "$TRUEHDD" --loglevel error decode --format caf --output-path "$base" "$@"
+}
+reference "$REF/unfold_p3" --presentation 3 "$SAMPLES/dolby-unfold.thd"
+reference "$REF/unfold_p2" --presentation 2 "$SAMPLES/dolby-unfold.thd"
+reference "$REF/dolby120" --presentation 3 "$SAMPLES/dolby-714-test-120s.thd"
+for f in "$ASSETS"/*.mlp; do
+    reference "$REF/fixtures/$(basename "$f" .mlp)" --presentation max "$f"
+done
+
+# ---- harness against the macOS slice ------------------------------------------------------
+MAC="$XCFW/macos-arm64_x86_64"
+clang -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=15.0 \
+    -I"$MAC/Headers/SiloObjectAudio" $(pkg-config --cflags libavformat) \
+    -o "$OUT/harness" "$HERE/harness.c" "$MAC/libtruehd_atmos.a" \
+    $(pkg-config --libs libavformat libavcodec libavutil)
+H="$OUT/harness"
+
+failures=0
+run() { # <label> <harness args...>
+    local label="$1" status=0
+    shift
+    local log="$OUT/$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_').log"
+    echo
+    echo "======== $label"
+    "$H" "$@" >"$log" 2>&1 || status=$?
+    grep -v 'no PTS found at end of file' "$log" || true
+    if [ "$status" -ne 0 ]; then
+        echo "!!!!!!!! FAILED: $label"
+        failures=$((failures + 1))
+    fi
+}
+# The first case prints the per-second motion summary; the rest only their checks.
+run "Unfold demo (M2TS, 1 AU per packet), p3 + OAMD + seek" \
+    --objects 0,1,2,3 --ref-audio "$REF/unfold_p3.atmos.audio" \
+    --ref-metadata "$REF/unfold_p3.atmos.metadata" --reset-at 8 --resume-at 15 \
+    "$SAMPLES/dolby-unfold-lossless.m2ts"
+run "Unfold demo (raw .thd, random 1..16384-byte chunks), seek into mid-access-unit" \
+    --no-summary --ref-audio "$REF/unfold_p3.atmos.audio" \
+    --ref-metadata "$REF/unfold_p3.atmos.metadata" --reset-at 5 --resume-at 20 \
+    "$SAMPLES/dolby-unfold.thd"
+run "Dolby 7.1.4 test (MKA, 120 s), p3 + OAMD + seek" \
+    --no-summary --ref-audio "$REF/dolby120.atmos.audio" \
+    --ref-metadata "$REF/dolby120.atmos.metadata" --reset-at 30 --resume-at 90 \
+    "$SAMPLES/dolby-714-test-120s.mka"
+run "Unfold demo, 7.1 fallback (presentation 2) + seek" \
+    --no-summary --presentation 2 --ref-audio "$REF/unfold_p2.caf" --reset-at 3 --resume-at 11 \
+    "$SAMPLES/dolby-unfold-lossless.m2ts"
+run "Unfold demo, HIGHEST_CHANNEL_BASED selector" \
+    --no-summary --presentation channel --ref-audio "$REF/unfold_p2.caf" "$SAMPLES/dolby-unfold.thd"
+run "FFmpeg FATE atmos.thd" --no-summary "$SAMPLES/fate-atmos.thd"
+for f in "$ASSETS"/*.mlp; do
+    b="$(basename "$f" .mlp)"
+    if [ -f "$REF/fixtures/$b.atmos.audio" ]; then
+        run "fixture $b" --no-summary --ref-audio "$REF/fixtures/$b.atmos.audio" \
+            --ref-metadata "$REF/fixtures/$b.atmos.metadata" "$f"
+    else
+        run "fixture $b" --no-summary --ref-audio "$REF/fixtures/$b.caf" "$f"
+    fi
+done
+
+# ---- every slice links; Swift sees the module ----------------------------------------------
+echo
+echo "======== link check per slice"
+cat >"$OUT/link.c" <<'EOF'
+#include "truehd_atmos.h"
+int main(void) {
+    TrueHDAtmosDecoder *d = truehd_atmos_decoder_create(TRUEHD_ATMOS_PRESENTATION_HIGHEST);
+    TrueHDAtmosBlock b;
+    int st = truehd_atmos_decoder_pull(d, &b);
+    truehd_atmos_decoder_destroy(d);
+    return truehd_atmos_selftest() == 0 && st == TRUEHD_ATMOS_NEED_MORE_DATA ? 0 : 1;
+}
+EOF
+for spec in "ios-arm64 arm64-apple-ios18.0 iphoneos" \
+    "ios-arm64-simulator arm64-apple-ios18.0-simulator iphonesimulator" \
+    "tvos-arm64 arm64-apple-tvos18.0 appletvos" \
+    "tvos-arm64-simulator arm64-apple-tvos18.0-simulator appletvsimulator" \
+    "xros-arm64 arm64-apple-xros2.0 xros" \
+    "xros-arm64-simulator arm64-apple-xros2.0-simulator xrsimulator" \
+    "macos-arm64_x86_64 x86_64-apple-macos15.0 macosx"; do
+    read -r slice triple sdk <<<"$spec"
+    if xcrun --sdk "$sdk" clang -target "$triple" -I"$XCFW/$slice/Headers/SiloObjectAudio" "$OUT/link.c" \
+        "$XCFW/$slice/libtruehd_atmos.a" -o "$OUT/link-$slice" 2>"$OUT/link-$slice.log"; then
+        echo "  $slice ($triple): links"
+    else
+        echo "  $slice ($triple): LINK FAILED"
+        cat "$OUT/link-$slice.log"
+        failures=$((failures + 1))
+    fi
+done
+arch -x86_64 "$OUT/link-macos-arm64_x86_64" 2>/dev/null && echo "  macOS x86_64 slice runs under Rosetta: selftest OK" ||
+    echo "  (macOS x86_64 slice not run: Rosetta unavailable or failed)"
+
+echo
+echo "======== Swift through the module map"
+cat >"$OUT/swift_check.swift" <<'EOF'
+import Foundation
+import SiloObjectAudio
+
+let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+guard let decoder = truehd_atmos_decoder_create(TRUEHD_ATMOS_PRESENTATION_HIGHEST) else { exit(1) }
+defer { truehd_atmos_decoder_destroy(decoder) }
+_ = data.withUnsafeBytes { truehd_atmos_decoder_push(decoder, $0.bindMemory(to: UInt8.self).baseAddress, $0.count, 0) }
+var block = TrueHDAtmosBlock()
+var blocks = 0, updates = 0
+while truehd_atmos_decoder_pull(decoder, &block) == TRUEHD_ATMOS_OK {
+    blocks += 1
+    if let md = block.metadata { updates += Int(md.pointee.update_count) }
+}
+var info = TrueHDAtmosStreamInfo()
+_ = truehd_atmos_decoder_get_stream_info(decoder, &info)
+print("Swift: \(blocks) blocks, p\(info.selected_presentation) \(block.channel_count) ch @ \(info.sample_rate) Hz, \(updates) metadata updates, selftest \(truehd_atmos_selftest())")
+exit(blocks > 0 ? 0 : 1)
+EOF
+if xcrun swiftc -O -I "$MAC/Headers/SiloObjectAudio" "$OUT/swift_check.swift" "$MAC/libtruehd_atmos.a" \
+    -o "$OUT/swift_check" 2>"$OUT/swift.log" && "$OUT/swift_check" "$ASSETS/fba_atmos_obj.mlp" 2>/dev/null; then
+    :
+else
+    echo "  SWIFT CHECK FAILED"
+    cat "$OUT/swift.log"
+    failures=$((failures + 1))
+fi
+
+# ---- optional: run the tvOS simulator slice in a temporary simulator ------------------------
+# VERIFY_TVOS_SIM=1 creates an Apple TV simulator, decodes the Unfold demo there with the
+# tvos-arm64-simulator slice, and compares the digest with the macOS slice's. The simulator is
+# deleted afterwards; no existing simulator is touched.
+if [ "${VERIFY_TVOS_SIM:-0}" = 1 ]; then
+    echo
+    echo "======== tvOS simulator (tvos-arm64-simulator slice) vs macOS slice"
+    xcrun clang -O2 -mmacosx-version-min=15.0 -I"$MAC/Headers/SiloObjectAudio" "$HERE/checksum.c" \
+        "$MAC/libtruehd_atmos.a" -o "$OUT/checksum-macos"
+    xcrun --sdk appletvsimulator clang -O2 -target arm64-apple-tvos18.0-simulator \
+        -I"$XCFW/tvos-arm64-simulator/Headers/SiloObjectAudio" "$HERE/checksum.c" \
+        "$XCFW/tvos-arm64-simulator/libtruehd_atmos.a" -o "$OUT/checksum-tvos-sim"
+    runtime="$(xcrun simctl list runtimes | awk '/^tvOS/ {id=$NF} END {print id}')"
+    devtype="$(xcrun simctl list devicetypes | grep -o 'com.apple.CoreSimulator.SimDeviceType.Apple-TV-4K[^)]*' | head -1)"
+    udid="$(xcrun simctl create "SiloObjectAudio verify" "$devtype" "$runtime")"
+    trap 'xcrun simctl shutdown "$udid" >/dev/null 2>&1; xcrun simctl delete "$udid" >/dev/null 2>&1' EXIT
+    xcrun simctl boot "$udid"
+    host="$("$OUT/checksum-macos" "$SAMPLES/dolby-unfold.thd" 2>/dev/null)"
+    sim="$(xcrun simctl spawn "$udid" "$OUT/checksum-tvos-sim" "$SAMPLES/dolby-unfold.thd" 2>/dev/null)"
+    echo "  macOS:        $host"
+    echo "  tvOS sim:     $sim"
+    if [ -n "$sim" ] && [ "$host" = "$sim" ]; then
+        echo "  identical output"
+    else
+        echo "  TVOS SIMULATOR OUTPUT DIFFERS"
+        failures=$((failures + 1))
+    fi
+fi
+
+echo
+if [ "$failures" -eq 0 ]; then echo "ALL CHECKS PASSED"; else echo "$failures CHECK(S) FAILED"; exit 1; fi

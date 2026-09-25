@@ -1,0 +1,355 @@
+//! Behaviour of the C API that the sample harness does not reach: argument handling,
+//! presentation switching, back-pressure, and damaged input. Runs in-process through the same
+//! `extern "C"` functions the xcframework exports.
+
+use std::path::PathBuf;
+use std::ptr;
+use truehd_atmos::types::*;
+use truehd_atmos::*;
+
+fn asset(name: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../truehdd/truehd/tests/assets")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn sample(name: &str) -> Option<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../samples").join(name);
+    std::fs::read(path).ok()
+}
+
+fn empty_block() -> Block {
+    Block {
+        sample_rate: 0,
+        frame_count: 0,
+        channel_count: 0,
+        presentation: 0,
+        flags: 0,
+        access_unit_frames: 0,
+        pts: 0,
+        pts_au_index: 0,
+        layout_serial: 0,
+        sample_position: 0,
+        input_access_unit: 0,
+        input_frame_offset: 0,
+        channels: ptr::null(),
+        speakers: ptr::null(),
+        metadata: ptr::null(),
+    }
+}
+
+struct Decoder(*mut TrueHDAtmosDecoder);
+
+impl Decoder {
+    fn new(presentation: i32) -> Self {
+        let d = truehd_atmos_decoder_create(presentation);
+        assert!(!d.is_null());
+        Self(d)
+    }
+
+    fn push(&self, data: &[u8], pts: i64) -> Status {
+        unsafe { truehd_atmos_decoder_push(self.0, data.as_ptr(), data.len(), pts) }
+    }
+
+    /// Pulls every available block, returning (presentation, channels, flags, serial) of each.
+    fn drain(&self) -> Vec<(u32, u32, u32, u32)> {
+        let mut out = Vec::new();
+        loop {
+            let mut b = empty_block();
+            let st = unsafe { truehd_atmos_decoder_pull(self.0, &mut b) };
+            match st {
+                OK => {
+                    assert!(b.frame_count > 0 && b.frame_count <= 160);
+                    assert!(b.channel_count > 0 && b.channel_count <= 16);
+                    // Every plane must be readable for frame_count samples in [-1, 1).
+                    for c in 0..b.channel_count as usize {
+                        let plane = unsafe {
+                            std::slice::from_raw_parts(*b.channels.add(c), b.frame_count as usize)
+                        };
+                        assert!(plane.iter().all(|v| (-1.0..1.0).contains(v)));
+                    }
+                    out.push((b.presentation, b.channel_count, b.flags, b.layout_serial));
+                }
+                NEED_MORE_DATA => return out,
+                other => panic!("pull returned {other}"),
+            }
+        }
+    }
+
+    fn stats(&self) -> Stats {
+        let mut s = Stats::default();
+        assert_eq!(unsafe { truehd_atmos_decoder_get_stats(self.0, &mut s) }, OK);
+        s
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        unsafe { truehd_atmos_decoder_destroy(self.0) };
+    }
+}
+
+#[test]
+fn arguments_are_checked() {
+    assert!(truehd_atmos_decoder_create(4).is_null());
+    assert!(truehd_atmos_decoder_create(-3).is_null());
+    unsafe {
+        truehd_atmos_decoder_destroy(ptr::null_mut());
+        assert_eq!(truehd_atmos_decoder_reset(ptr::null_mut()), ERR_NULL);
+        assert_eq!(truehd_atmos_decoder_push(ptr::null_mut(), ptr::null(), 4, 0), ERR_NULL);
+        let mut b = empty_block();
+        assert_eq!(truehd_atmos_decoder_pull(ptr::null_mut(), &mut b), ERR_NULL);
+        assert!(!truehd_atmos_decoder_last_error(ptr::null()).is_null());
+    }
+
+    let d = Decoder::new(PRESENTATION_HIGHEST);
+    unsafe {
+        assert_eq!(truehd_atmos_decoder_push(d.0, ptr::null(), 0, 0), OK);
+        assert_eq!(truehd_atmos_decoder_push(d.0, ptr::null(), 1, 0), ERR_NULL);
+        assert_eq!(truehd_atmos_decoder_pull(d.0, ptr::null_mut()), ERR_NULL);
+        assert_eq!(truehd_atmos_decoder_set_presentation(d.0, 7), ERR_INVALID_ARGUMENT);
+        let mut info = std::mem::zeroed::<StreamInfo>();
+        assert_eq!(truehd_atmos_decoder_get_stream_info(d.0, &mut info), ERR_NOT_READY);
+        let mut b = empty_block();
+        assert_eq!(truehd_atmos_decoder_pull(d.0, &mut b), NEED_MORE_DATA);
+    }
+    assert_eq!(unsafe { std::ffi::CStr::from_ptr(truehd_atmos_speaker_name(10)) }, c"Tbl");
+    assert_eq!(unsafe { std::ffi::CStr::from_ptr(truehd_atmos_speaker_name(254)) }, c"Obj");
+}
+
+#[test]
+fn input_beyond_the_limit_is_refused_until_pulled() {
+    let d = Decoder::new(PRESENTATION_HIGHEST);
+    let chunk = vec![0u8; 1 << 20];
+    let mut accepted = 0;
+    while d.push(&chunk, NO_PTS) == OK {
+        accepted += 1;
+        assert!(accepted <= 8, "the 8 MiB limit was not enforced");
+    }
+    assert_eq!(d.push(&chunk, NO_PTS), ERR_BUFFER_FULL);
+    // Pulling scans (and, holding no major sync, lets go of) the garbage.
+    assert!(d.drain().is_empty());
+    assert_eq!(d.push(&chunk, NO_PTS), OK);
+}
+
+#[test]
+fn switching_presentation_changes_layout_at_the_next_major_sync() {
+    let data = asset("fba_atmos_obj.mlp");
+    let d = Decoder::new(PRESENTATION_HIGHEST);
+    let half = data.len() / 2;
+    assert_eq!(d.push(&data[..half], 0), OK);
+    let before = d.drain();
+    assert!(!before.is_empty());
+    assert!(before.iter().all(|b| b.0 == 3 && b.1 == 16));
+
+    assert_eq!(
+        unsafe { truehd_atmos_decoder_set_presentation(d.0, PRESENTATION_HIGHEST_CHANNEL_BASED) },
+        OK
+    );
+    assert_eq!(d.push(&data[half..], 1), OK);
+    let after = d.drain();
+    // The fixture has one more major sync in its second half.
+    assert!(!after.is_empty(), "no blocks after the switch");
+    let (p, ch, flags, serial) = after[0];
+    assert_eq!((p, ch), (2, 8));
+    assert!(flags & BLOCK_DISCONTINUITY != 0 && flags & BLOCK_LAYOUT_CHANGED != 0);
+    assert_ne!(serial, before[0].3);
+    assert!(after.iter().all(|b| b.0 == 2 && b.3 == serial));
+}
+
+#[test]
+fn reset_keeps_the_layout_serial_of_the_same_stream() {
+    let data = asset("fba_atmos_dimtrim.mlp");
+    let d = Decoder::new(PRESENTATION_HIGHEST);
+    d.push(&data, 0);
+    let first = d.drain();
+    assert_eq!(unsafe { truehd_atmos_decoder_reset(d.0) }, OK);
+    d.push(&data, 0);
+    let second = d.drain();
+    assert_eq!(first.len(), second.len());
+    assert_eq!(first[0].3, second[0].3);
+    assert!(second[0].2 & BLOCK_DISCONTINUITY != 0);
+    assert!(second[0].2 & BLOCK_LAYOUT_CHANGED == 0);
+}
+
+/// Damaged input must never surface a panic, must be counted, and decoding must continue.
+#[test]
+fn damaged_input_is_survived() {
+    let data = sample("dolby-unfold.thd").unwrap_or_else(|| asset("fba_atmos_dimtrim.mlp"));
+    let clean_blocks = {
+        let d = Decoder::new(PRESENTATION_HIGHEST);
+        d.push(&data, 0);
+        d.drain().len()
+    };
+
+    let mut state = 0x2545F4914F6CDD1Du64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for round in 0..6 {
+        let mut damaged = data.clone();
+        // Bit flips, zeroed runs and inserted garbage, spread over the stream.
+        let flips = [20usize, 200, 2000, 50, 5, 500][round];
+        for _ in 0..flips {
+            let at = (rand() as usize) % damaged.len();
+            match rand() % 3 {
+                0 => damaged[at] ^= 1 << (rand() % 8),
+                1 => {
+                    let end = (at + 64).min(damaged.len());
+                    damaged[at..end].fill(0);
+                }
+                _ => {
+                    let junk: Vec<u8> = (0..(rand() % 700)).map(|_| rand() as u8).collect();
+                    damaged.splice(at..at, junk);
+                }
+            }
+        }
+        let d = Decoder::new(PRESENTATION_HIGHEST);
+        let mut blocks = 0;
+        for (i, chunk) in damaged.chunks(1 + (rand() % 5000) as usize).enumerate() {
+            assert_eq!(d.push(chunk, i as i64), OK);
+            blocks += d.drain().len();
+        }
+        let s = d.stats();
+        assert!(s.decode_errors + s.sync_errors > 0, "round {round}: damage went unnoticed");
+        assert!(
+            blocks * 10 >= clean_blocks * 5,
+            "round {round}: only {blocks} of {clean_blocks} blocks survived"
+        );
+        let message = unsafe { std::ffi::CStr::from_ptr(truehd_atmos_decoder_last_error(d.0)) };
+        assert!(!message.to_bytes().is_empty());
+    }
+
+    // Pure noise: no blocks, no panic.
+    let noise: Vec<u8> = (0..3_000_000).map(|_| rand() as u8).collect();
+    let d = Decoder::new(PRESENTATION_HIGHEST);
+    for chunk in noise.chunks(65536) {
+        assert_eq!(d.push(chunk, NO_PTS), OK);
+        assert!(d.drain().is_empty());
+    }
+}
+
+/// Every presentation of every fixture decodes, and the stream info agrees with the blocks.
+#[test]
+fn every_presentation_of_every_fixture() {
+    for name in [
+        "fba_176k.mlp",
+        "fba_192k.mlp",
+        "fba_192k_8ch.mlp",
+        "fba_2ch.mlp",
+        "fba_atmos_cbi.mlp",
+        "fba_atmos_dimtrim.mlp",
+        "fba_atmos_obj.mlp",
+        "fba_spliced.mlp",
+        "fbb_6ch.mlp",
+        "fbb_6ch_single.mlp",
+        "fbb_copy.mlp",
+        "fbb_spliced.mlp",
+    ] {
+        let data = asset(name);
+        for selection in [-2, -1, 0, 1, 2, 3] {
+            let d = Decoder::new(selection);
+            d.push(&data, 0);
+            let blocks = d.drain();
+            assert!(!blocks.is_empty(), "{name} p{selection}: no output");
+            let s = d.stats();
+            assert_eq!(s.decode_errors + s.sync_errors, 0, "{name} p{selection}");
+            let mut info = unsafe { std::mem::zeroed::<StreamInfo>() };
+            assert_eq!(unsafe { truehd_atmos_decoder_get_stream_info(d.0, &mut info) }, OK);
+            let p = blocks[0].0;
+            assert_eq!(info.selected_presentation, p, "{name} p{selection}");
+            assert_eq!(
+                info.presentations[p as usize].channel_count, blocks[0].1,
+                "{name} p{selection}: stream info channel count"
+            );
+            if selection == -2 {
+                assert!(p <= 2, "{name}: channel-based selector decoded p{p}");
+            }
+        }
+    }
+}
+
+/// Access-unit starts of a clean stream, by following the length fields.
+fn access_units(data: &[u8]) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p + 8 <= data.len() {
+        let len = ((u16::from_be_bytes([data[p], data[p + 1]]) & 0xFFF) as usize) * 2;
+        if len < 8 {
+            break;
+        }
+        let major = data[p + 4..p + 8] == [0xF8, 0x72, 0x6F, 0xBA];
+        out.push((p, major));
+        p += len;
+    }
+    out
+}
+
+fn first_block(d: &Decoder) -> Option<Block> {
+    let mut b = empty_block();
+    (unsafe { truehd_atmos_decoder_pull(d.0, &mut b) } == OK).then_some(b)
+}
+
+/// One-byte pushes from just after a major sync, where the next one is tens of kilobytes away:
+/// input must never be refused for its chunking, and the count must come out exact.
+#[test]
+fn tiny_pushes_far_from_a_major_sync() {
+    let Some(data) = sample("dolby-714-test-120s.thd").or_else(|| sample("dolby-unfold.thd")) else {
+        return;
+    };
+    let aus = access_units(&data[..4 << 20]);
+    let majors: Vec<usize> = (0..aus.len()).filter(|&i| aus[i].1).collect();
+    // The access unit right after a major sync, where the next one is furthest away in bytes.
+    let (start, next) = majors
+        .windows(2)
+        .map(|w| (w[0] + 1, w[1]))
+        .max_by_key(|&(a, b)| aus[b].0 - aus[a].0)
+        .unwrap();
+    let d = Decoder::new(PRESENTATION_HIGHEST);
+    let mut first = None;
+    for (i, byte) in data[aus[start].0..].iter().enumerate() {
+        assert_eq!(d.push(std::slice::from_ref(byte), i as i64), OK, "push {i} refused");
+        if let Some(b) = first_block(&d) {
+            first = Some(b);
+            break;
+        }
+    }
+    let b = first.expect("no block");
+    assert_eq!(b.input_access_unit, (next - start) as u64);
+    // pts is the index of the push holding the access unit's first byte while that push had a
+    // record of its own; past 65536 waiting pushes it is unknown rather than wrong.
+    let first_byte_push = (aus[next].0 - aus[start].0) as i64;
+    if first_byte_push < 1 << 16 {
+        assert_eq!((b.pts, b.pts_au_index), (first_byte_push, 0));
+    } else {
+        assert_eq!(b.pts, NO_PTS);
+    }
+    assert_eq!(b.flags & BLOCK_INPUT_OFFSET_ESTIMATED, 0);
+    assert!(aus[next].0 - aus[start].0 > 1 << 16, "not far enough to exercise the limit");
+}
+
+/// A damaged first access unit after reset still counts, and is flagged as unverified.
+#[test]
+fn a_damaged_first_access_unit_is_counted() {
+    let data = asset("fba_atmos_dimtrim.mlp");
+    let aus = access_units(&data);
+    assert!(aus[0].1, "fixture starts at a major sync");
+    let next = (1..aus.len()).find(|&i| aus[i].1).unwrap();
+
+    let mut damaged = data.clone();
+    damaged[4 + 10] ^= 0x40; // inside the major sync info: its CRC no longer matches
+    let d = Decoder::new(PRESENTATION_HIGHEST);
+    assert_eq!(d.push(&damaged, 7), OK);
+    let b = first_block(&d).expect("no block");
+    assert_eq!(b.input_access_unit, next as u64, "access units before the next major sync");
+    assert_eq!(b.pts, 7);
+    assert_eq!(b.pts_au_index as u64, b.input_access_unit, "one push: pts index = ordinal");
+    assert_ne!(b.flags & BLOCK_INPUT_OFFSET_ESTIMATED, 0);
+    assert_eq!(d.stats().sync_errors, 1);
+    let message = unsafe { std::ffi::CStr::from_ptr(truehd_atmos_decoder_last_error(d.0)) };
+    assert!(!message.to_bytes().is_empty(), "damage must leave a message");
+}

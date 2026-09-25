@@ -1,0 +1,23 @@
+SiloObjectAudio (truehd-atmos-ffi)
+C API and Apple packaging of a Dolby TrueHD / Dolby Atmos decoder.
+
+This product includes software from the truehdd project
+(https://github.com/truehdd/truehdd), commit 45eff984e3e5ab0cf36a47d12148b1628c38bda4:
+the `truehd` crate (TrueHD/MLP parser and decoder), Copyright Rainbaby and the truehdd
+contributors, licensed under the Apache License, Version 2.0.
+
+This product includes the `oamd` crate 0.1.0 (https://github.com/truehdd/oamd), the object
+audio metadata parser used by `truehd`, Copyright Rainbaby, licensed under the Apache License,
+Version 2.0.
+
+The static library also contains, compiled in, the Rust standard library and these crates,
+each available under the MIT license or the Apache License, Version 2.0 (memchr: the MIT
+license or the Unlicense): anyhow, bitstream-io, log, memchr, no_std_io2, thiserror.
+
+The code in this directory (src/, include/, harness/, tests/, build.sh) is licensed under the
+Apache License, Version 2.0; see LICENSE. It frames access units itself, following the
+validation rules of truehd::process::extract::Extractor, and computes object metadata update
+times per ETSI TS 103 420 clause 5.3.
+
+Dolby, Dolby Atmos and Dolby TrueHD are trademarks of Dolby Laboratories. This software is not
+affiliated with or endorsed by Dolby Laboratories.
